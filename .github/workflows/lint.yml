@@ -1,0 +1,36 @@
+name: Check Linting
+
+on:
+  push
+
+jobs:
+  python-lint:
+    name: Lint Python files
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+        with:
+          persist-credentials: false
+
+      - name: Installing Flake8
+        run: pip3 install flake8
+      - name: Lint with flake8
+        run: flake8 . --count --max-line-length=127 --statistics --extend-ignore=E402
+
+  markdown-lint:
+    name: Lint markdown files (check links validity)
+    runs-on: ubuntu-20.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+        with:
+          persist-credentials: false
+
+      - name: Check the validity of the links in the documentation
+        uses: gaurav-nelson/github-action-markdown-link-check@v1
+        with:
+          use-quiet-mode: 'yes'
+          folder-path: '.'

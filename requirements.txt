@@ -1,0 +1,8 @@
+tensorflow==2.12.0
+h5py==3.7.0
+matplotlib==3.5.3
+scikit-learn==1.1.2
+SciencePlots==1.0.9
+pypacker==5.1
+lxml==4.9.1
+psutil==5.9.2
