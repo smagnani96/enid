@@ -14,6 +14,8 @@
 """File defining the LucidMlp Detection Engine"""
 from dataclasses import dataclass, field
 
+import numpy as np
+
 from .lucid_cnn import LucidCnn, LucidDeParams, tf
 
 
@@ -31,6 +33,18 @@ class LucidMlp(LucidCnn):
     """
     de_params = MlpDeParams
 
+    @staticmethod
+    def _fed_adapt_layer(src_w, dst_w, global_f, local_f, pad=False):
+        if src_w.shape == dst_w.shape:
+            return src_w
+        indexes = [i for i, f in enumerate(global_f) if f in local_f]
+        if pad:
+            ret = np.zeros(
+                dst_w.shape if dst_w.shape[0] > src_w.shape[0] else src_w)
+            ret[indexes, ...] = src_w[indexes, ...]
+            return ret
+        return src_w[indexes, ...]
+
     @classmethod
     def _get_arch(
             cls, packets_per_session: int = None, features: int = None,
@@ -41,11 +55,12 @@ class LucidMlp(LucidCnn):
             packets_per_session = max_packets_per_session
         if max_features:
             features = max_features
+
         model = tf.keras.models.Sequential([
             tf.keras.layers.InputLayer(
                 input_shape=(packets_per_session, features), name="Input"),
             tf.keras.layers.Flatten(name="Flatten"),
-            tf.keras.layers.Dense(kernels, name='Dense'),
+            tf.keras.layers.Dense(kernels, name='TARGET'),
             tf.keras.layers.Dropout(dropout, name="Dropout"),
             tf.keras.layers.Activation(
                 tf.keras.activations.relu, name="ReLu"),
@@ -56,7 +71,8 @@ class LucidMlp(LucidCnn):
 
         if learning_rate:
             model.compile(loss=tf.keras.metrics.binary_crossentropy,
-                          optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
+                          optimizer=tf.keras.optimizers.Adam(
+                              learning_rate=learning_rate),
                           metrics=["accuracy"])
 
         return model

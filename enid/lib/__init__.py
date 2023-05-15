@@ -68,5 +68,6 @@ ATTACK_LABELS = {
             ['18.218.83.150', '172.31.69.28'])),
     'IDS2019': lambda _: tuple(
         TwoIPsKey.create("IDS2019", "", "", ip=x, ip1=y) for x, y in itertools.product(
-            ['172.16.0.5'], ['192.168.50.1', '192.168.50.4']))
+            ['172.16.0.5'], ['192.168.50.1', '192.168.50.4'])),
+    'BENIGN': lambda _: tuple(),
 }

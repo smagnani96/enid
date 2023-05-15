@@ -24,15 +24,17 @@ for the single pcap).
 import argparse
 import os
 from dataclasses import dataclass, field
-from typing import Type, Dict
-import tensorflow as tf
+from typing import Dict, Type
+
 import numpy as np
-from .datasetter import DatasetConfig, DatasetTestConfig
+import tensorflow as tf
+
+from .datasetter import DatasetConfig, DatasetTrainConfig
 from .lib.definitions import DeParams, DetectionEngine
 from .lib.metrics import TrainMetric
-from .lib.utility import (add_param_to_parser, create_dir, dump_json_data,
-                          get_logger, get_param_for_method, load_json_data,
-                          set_seed)
+from .lib.utility import (SplitType, add_param_to_parser, create_dir,
+                          dump_json_data, get_logger, get_param_for_method,
+                          load_json_data, splittable_int)
 
 _logger = get_logger(__name__)
 
@@ -69,11 +71,38 @@ class ResultTrain(TrainMetric):
             if not isinstance(self.datasets[k], ResultDataset):
                 self.datasets[k] = ResultDataset(**self.datasets[k])
 
+    def update(self, test_dict: DatasetTrainConfig, pt):
+        # registering results at each granularity
+        if len(pt) != len(self._ypred):
+            return
+        i = 0
+        for dataset_name, v in test_dict.datasets.items():
+            self.datasets[dataset_name] = ResultDataset()
+            for cat, val in v.categories.items():
+                self.datasets[dataset_name].categories[cat] = ResultCategory()
+                for pcap, target in val.captures.items():
+                    next_i = i + target.benign.test_taken + target.malicious.test_taken
+                    indexes = np.where(
+                        np.logical_and(pt >= i, pt < next_i))
+                    y_pred_slice = self._ypred[indexes]
+                    y_test_slice = self._ytrue[indexes]
+                    self.datasets[dataset_name].categories[cat].captures[pcap] = TrainMetric(
+                        _threshold=[
+                            (self._threshold[0][0], y_pred_slice.size)],
+                        _ypred=y_pred_slice,
+                        _ytrue=y_test_slice)
+                    self.datasets[dataset_name].categories[cat].update(
+                        self.datasets[dataset_name].categories[cat].captures[pcap])
+                    i = next_i
+                self.datasets[dataset_name].update(
+                    self.datasets[dataset_name].categories[cat])
+
 
 @dataclass
 class ModelConfig:
     detection_engine: Type[DetectionEngine]
     train_params: Type[DeParams]
+    split_type: SplitType = field(default=SplitType.NONE)
 
     def __post_init__(self):
         if isinstance(self.detection_engine, str):
@@ -82,6 +111,8 @@ class ModelConfig:
         if isinstance(self.train_params, dict):
             self.train_params = self.detection_engine.de_params(
                 **self.train_params)
+        if isinstance(self.split_type, int):
+            self.split_type = SplitType(self.split_type)
 
     def join(self, other: "ModelConfig") -> bool:
         if self.detection_engine != other.detection_engine or str(self.train_params) != str(other.train_params):
@@ -90,7 +121,8 @@ class ModelConfig:
 
 
 def train(dataset_path: str, de: Type[DetectionEngine],
-          models_dir, test_dict: DatasetTestConfig, train_params, c):
+          models_dir, test_dict: DatasetTrainConfig, train_params: Type[DeParams], c,
+          split_type: SplitType, split_chunk):
     """Function for training a given configuration"""
 
     tf.keras.backend.clear_session()
@@ -106,36 +138,21 @@ def train(dataset_path: str, de: Type[DetectionEngine],
     create_dir(new_path, overwrite=True)
 
     # calling the Detection Model specific train method
-    set_seed()
-    hs, hp, res, features_holder, pt = de.train(
-        dataset_path, new_path, train_params, **c)
-    res = ResultTrain(**res.__dict__)
+    hs, hp, best_model, xts, yts, features_holder, pt = de.train(
+        dataset_path, new_path, train_params, split_type, split_chunk, **c)
 
-    # registering results at each granularity
-    i = 0
-    for dataset_name, v in test_dict.datasets.items():
-        res.datasets[dataset_name] = ResultDataset()
-        for cat, val in v.categories.items():
-            res.datasets[dataset_name].categories[cat] = ResultCategory()
-            for pcap, target in val.captures.items():
-                next_i = i + target.benign + target.malicious
-                indexes = np.where(
-                    np.logical_and(pt >= i, pt < next_i))
-                y_pred_slice = res._ypred[indexes]
-                y_test_slice = res._ytrue[indexes]
-                res.datasets[dataset_name].categories[cat].captures[pcap] = TrainMetric(
-                    _threshold=[(res._threshold[0][0], y_pred_slice.size)],
-                    _ypred=y_pred_slice,
-                    _ytrue=y_test_slice)
-                res.datasets[dataset_name].categories[cat].update(
-                    res.datasets[dataset_name].categories[cat].captures[pcap])
-                i = next_i
-            res.datasets[dataset_name].update(
-                res.datasets[dataset_name].categories[cat])
+    _logger.info(f"Testing {name}")
+    y_pred = de.predict(best_model, xts, **hp.__dict__)
 
     dump_json_data(features_holder, os.path.join(new_path, "relevance.json"))
     dump_json_data(hs, os.path.join(new_path, "history.json"))
     dump_json_data(hp, os.path.join(new_path, "params.json"))
+
+    res = ResultTrain(
+        _threshold=hp.malicious_threshold,
+        _ypred=y_pred, _ytrue=yts)
+    res.update(test_dict, pt)
+
     dump_json_data(res, os.path.join(new_path, "results.json"))
 
 
@@ -148,7 +165,7 @@ def main(args_list):
     parser.add_argument(
         'output', help='output name', type=str)
     parser.add_argument(
-        '-r', '--recover', help='recover from last execution', action="store_true")
+        '-s', '--split-type', help='split type', type=splittable_int, default=SplitType.NONE)
 
     parser.add_argument("detection_engine", help="Select the detection engine to use", type=str,
                         choices=DetectionEngine.list_all())
@@ -191,22 +208,16 @@ def main(args_list):
     models_config = ModelConfig(
         de, de.de_params(
             **{a: args[a] for a in params_for_method if a not in add_comb_params},
-            **{a: sorted(args[a], reverse=True) for a in add_comb_params}))
+            **{a: sorted(args[a], reverse=True) for a in add_comb_params}), args["split_type"])
 
     models_dir = os.path.join(
         args["dataset"], args["output"], 'models')
 
-    # check if it is possible to recover from a previous unfinished training
-    if args["recover"] and (not load_json_data(os.path.join(models_dir, "conf.json"), fail=False) or
-                            len(dump_json_data(models_config)) != len(dump_json_data(load_json_data(
-            os.path.join(models_dir, "conf.json"), fail=False)))):
-        _logger.info("Unable to restore training, creating new one")
-        args["recover"] = False
-
-    create_dir(models_dir, overwrite=False if not args["recover"] else None)
+    create_dir(models_dir, overwrite=False)
 
     dump_json_data(models_config, os.path.join(models_dir, "conf.json"))
 
-    for c in models_config.train_params.all_train_combs():
-        train(args["dataset"], de, models_dir, dataset_config.test,
-              models_config.train_params, c)
+    combs = models_config.train_params.all_train_combs()
+    for i, c in enumerate(combs):
+        train(args["dataset"], de, models_dir, dataset_config.offline,
+              models_config.train_params, c, models_config.split_type, split_chunk=(i, len(combs)))

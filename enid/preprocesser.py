@@ -43,6 +43,7 @@ class PcapConfig:
     unique_malicious: int = 0
     benign_packets: int = 0
     malicious_packets: int = 0
+    duration: int = 0
 
 
 @dataclass
@@ -55,14 +56,14 @@ class CategoryConfig(PcapConfig, UpdatableDataclass):
 
 
 @dataclass
-class PreprocessedConfig:
-    family: str
-    time_window: float
-    key_cls: Type[BaseKey]
-    detection_engine: Type[DetectionEngine]
-    additional_params: Dict[str, Any]
-    categories: Dict[str, CategoryConfig]
-    captures_config: CaptureConfig
+class PreprocessedConfig(PcapConfig, UpdatableDataclass):
+    family: str = ""
+    time_window: int = 0
+    key_cls: Type[BaseKey] = None
+    detection_engine: Type[DetectionEngine] = None
+    additional_params: Dict[str, Any] = field(default_factory=dict)
+    categories: Dict[str, CategoryConfig] = field(default_factory=dict)
+    captures_config: CaptureConfig = field(default_factory=CaptureConfig)
 
     def __post_init__(self):
         if isinstance(self.captures_config, dict):
@@ -91,11 +92,12 @@ def process_pcap(target_dir, cap, dataset, cat, pcap, time_window, additional_pa
 
     _logger.info(f"Starting processing {pcap_file}")
     # Creating a fake traffic analysers with no Filtering and Classificator components.
-    TrafficAnalyser.generate_packets(pcap_file, t, pcap_file, labels=(dataset, cat, pcap))
+    tot_time = TrafficAnalyser.generate_packets(pcap_file, t, pcap_file, labels=(dataset, cat, pcap))
     _logger.info(f"Finished processing {pcap_file}")
     p = PcapConfig(t.processing_stats.tot_benign, t.processing_stats.tot_malicious,
                    t.processing_stats.unique_benign, t.processing_stats.unique_malicious,
-                   t.processing_stats.tot_benign_packets, t.processing_stats.tot_malicious_packets)
+                   t.processing_stats.tot_benign_packets, t.processing_stats.tot_malicious_packets,
+                   duration=tot_time)
     return target_dir, cat, pcap, p
 
 
@@ -177,6 +179,7 @@ def main(args_list):
                 prep_configs[td].categories[cat] = CategoryConfig()
             prep_configs[td].categories[cat].captures[pcap] = p
             prep_configs[td].categories[cat].update(p)
+            prep_configs[td].update(p)
 
     for td, val in prep_configs.items():
         _logger.info(f"Dumping {td} configuration with updated pcaps stats")

@@ -162,7 +162,7 @@ At this point, with all the preprocessed captures, you can easily create a datas
 1. they must have been created by using the same or compatible DetectionEngine;
 2. they must have been created by using the same parameters (e.g., same time window).
 
-An additional parameter to pass to this program is the percentage of the training set used for the validation and test sets. The network captures for the online test correspond to the ones used for the test set, but without balancing the samples, differently than for the training/validation/test sets. The resulting network capture is named `combined.pcap` and it contains all packets sorted by arrival time, while a `combined.joblib` containing the list of origin of each packet (i.e., dataset, category, and capture) is generated for the later test.
+An additional parameter to pass to this program is the percentage of the training set used for the validation and test sets. The network captures for the online test correspond to the ones used for the test set, but without balancing the samples, differently than for the training/validation/test sets. The resulting network capture is named `combined.pcap` and it contains all packets sorted by arrival time, while a `combined.pickle` containing the list of origin of each packet (i.e., dataset, category, and capture) is generated for the later test.
 
 Example:
 
@@ -175,11 +175,11 @@ datasets
     ├── validation.h5
     ├── test.h5
     ├── combined.pcap
-    ├── combined.joblib
+    ├── combined.pickle
     ├── conf.json
 ```
 
-### Step 6 - [Trainer](./enid/trainer.py)
+### Step 6 - [Trainer](./enid/trainer.py) and [Offline](./enid/offline.py)
 
 The creation of models is strictly related to the DetectionEngine of interests: each typology has its own set of parameters that can be either provided as a single value or as a list of possible values to try. To iteratively decrease the set of input information required for training and using the models (i.e., from using *F* features to *F-1*), the program leverages the pruning algorithm specified in the Engine definitions, which should remove, after ranking all the features, the least relevant one.
 
@@ -208,7 +208,7 @@ MyModelOutputDir
 ```
 In this case, a specific set of parameters is given (i.e., learning rate, regularization, kernels, batch size, dropout), hence the program does not need to perform a grid search to look for the best ones.
 
-### Step 7 - [Tester](./enid/tester.py)
+### Step 7 - [Online](./enid/online.py)
 
 The online testing of the generated models within the NIDS is performed in parallel leveraging all available CPU cores. Each model generated is tested against the capture generated while creating the dataset, and the entire infrastructure is built, following this pipeline:
 
@@ -224,7 +224,7 @@ This program requires a maximum number of monitored sessions per time window (de
 Example:
 
 ```bash
-❯ python3 -m enid tester datasets/IDS2017-LucidCnn/MyModelOutputDir
+❯ python3 -m enid online datasets/IDS2017-LucidCnn/MyModelOutputDir
 ❯ ls datasets/IDS2017-LucidCnn/MyModelOutputDir/normal_test
 normal_test
 ├── 10p-10f
@@ -256,7 +256,7 @@ Example:
 
 ### Step 7 - [Comparator](./enid/comparator.py) [Optional]
 
-In case [Step 7](#step-7---tester) has been executed using the enhanced debug mode, this file compares the Json output of the provided models to look for diversities in terms of blocked malicious/benign sessions. Additionally, you can specify a threshold that represents the n° of packets erroneously blocked/not-blocked that must be at least considered for printing the results, in case tons of flows are recorded.
+In case [Step 7](#step-7---online) has been executed using the enhanced debug mode, this file compares the Json output of the provided models to look for diversities in terms of blocked malicious/benign sessions. Additionally, you can specify a threshold that represents the n° of packets erroneously blocked/not-blocked that must be at least considered for printing the results, in case tons of flows are recorded.
 
 ## Write your Detection Model
 

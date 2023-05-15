@@ -14,11 +14,12 @@
 """File defining the LucidCnn Detection Engine, its TrafficAnalyser and all
 the parameters used."""
 import copy
+import math
 import os
 import time
 from dataclasses import dataclass, field, fields, replace
 from functools import lru_cache
-from typing import List, Tuple, Type
+from typing import Dict, List, Tuple, Type, Union
 
 import h5py
 import numpy as np
@@ -30,7 +31,7 @@ from ...definitions import (AnalysisState, BaseProcessingData, DeParams,
                             DetectionEngine, TrafficAnalyser)
 from ...identifiers import BaseKey
 from ...metrics import TrainMetric
-from ...utility import (get_all_dict_comb, get_best_comb,
+from ...utility import (SplitType, get_all_dict_comb, get_best_comb,
                         get_best_dispatch, get_logger, load_json_data,
                         set_seed, sort_keep_comb)
 from .features import LucidFeaturesHolder, Time
@@ -44,7 +45,8 @@ class LucidDeParams(DeParams):
     rerank_at_feature: int = None
     rerank_at_packet: int = None
     train_with_less: bool = False
-    prune_zero_first: bool = True
+    prune_zero_first: bool = False
+    learn_only_from_benign: bool = False
     rank_metric: str = "f1_score"
     max_loss: int = 20
     epochs: int = 500
@@ -107,10 +109,10 @@ class LucidTrafficAnalyser(TrafficAnalyser):
     def _terminate_timewindow_preprocessing(self):
         if not self.current_session_map:
             return
-        asd = next(x for x in self.attackers.values())
+        asd = next((x for x in self.attackers.values()), None)
         for i, k in enumerate(self.current_session_map):
             target = "benign"
-            if k.cast(asd[0]) in asd[1]:
+            if asd and k.cast(asd[0]) in asd[1]:
                 target = "malicious"
             setattr(self.processing_stats, f"tot_{target}_packets",
                     getattr(self.processing_stats, f"tot_{target}_packets") + self.current_session_map[k].metered_packets +
@@ -160,16 +162,10 @@ class LucidCnn(DetectionEngine):
         self.adjust_timestamp: int = None
         self._init_scale_method()
 
-    def predict(
-            self, ta: LucidTrafficAnalyser) -> Tuple[int, np.ndarray]:
-        data, conversion_time, preprocessing_time = self.preprocess_samples(ta)
-        predict_time = time.clock_gettime_ns(time.CLOCK_PROCESS_CPUTIME_ID)
-        predictions = self.model.predict(
-            data, batch_size=self.analysis_state.params.batch_size, verbose=0)
-        predict_time = time.clock_gettime_ns(
-            time.CLOCK_PROCESS_CPUTIME_ID) - predict_time
-        predictions = np.squeeze(predictions, axis=1).astype(np.float64)
-        return round(data.nbytes/len(predictions)), predictions, conversion_time, preprocessing_time, predict_time
+    @classmethod
+    def predict(cls, model, data, batch_size: int = None, **kwargs) -> np.ndarray:
+        return np.squeeze(model.predict(data, batch_size=batch_size,
+                                        verbose=0).astype(np.float64), axis=1)
 
     @classmethod
     def model_name(cls, packets_per_session: int, features: int = None, **kwargs):
@@ -190,8 +186,23 @@ class LucidCnn(DetectionEngine):
         return ret
 
     @staticmethod
+    def _fed_adapt_layer(src_w, dst_w, global_f, local_f, pad=False):
+        if src_w.shape == dst_w.shape:
+            return src_w
+        indexes = [i for i, f in enumerate(global_f) if f in local_f]
+        if pad:
+            ret = np.zeros(
+                (max(dst_w.shape[0], src_w.shape[0]),
+                 max(dst_w.shape[1], src_w.shape[1]),
+                 *dst_w.shape[2:]))
+            ret[:src_w.shape[0], indexes, ...] = src_w[:, :, ...]
+            return ret
+        return src_w[:min(src_w.shape[0], dst_w.shape[0]), indexes, ...]
+
+    @staticmethod
     def _load_dataset(basename, features_holder: LucidFeaturesHolder, packets_per_session=None,
-                      max_packets_per_session=None, max_features=None, **kwargs):
+                      max_packets_per_session=None, max_features=None,
+                      split_type=SplitType.NONE, split_chunk: Tuple[int, int] = tuple(), **kwargs):
         """Load dataset and format it according the current parameters features/packets"""
         not_current_indexes = [i for i, k in enumerate(features_holder.ALLOWED)
                                if k not in features_holder.value]
@@ -202,6 +213,20 @@ class LucidCnn(DetectionEngine):
         # if max_packets or max_features then keep their position but with the
         # value in that coord set to 0
         for i in range(len(ret)):
+            if split_type == SplitType.EQUALLY:
+                n_samples_per_type = math.floor(
+                    len(ret[i][0])/2/split_chunk[1])
+                indexes = np.where(ret[i][1] == 1.0)[
+                    0][split_chunk[0]*n_samples_per_type:(split_chunk[0]+1)*n_samples_per_type]
+                indexes = np.concatenate((indexes, np.where(ret[i][1] == 0.0)[
+                                         0][split_chunk[0]*n_samples_per_type:(split_chunk[0]+1)*n_samples_per_type]))
+                ret[i][0] = ret[i][0][indexes, ...]
+                ret[i][1] = ret[i][1][indexes, ...]
+            elif split_type == SplitType.NONE:
+                pass
+            else:
+                raise NotImplementedError()
+
             if not packets_per_session:  # Ho solo features aggregate, non pacchetti
                 if max_features:
                     ret[i][0][:, not_current_indexes] = 0.0
@@ -219,23 +244,24 @@ class LucidCnn(DetectionEngine):
                     ret[i][0] = ret[i][0][:, :, current_indexes]
         return ret[0], ret[1], ret[2]
 
-    def load_model(self):
-        current_name = self.model_name(**self.analysis_state.params.__dict__)
-        self.analysis_state.current_features = self.features_holder_cls(**load_json_data(
-            os.path.join(self.base_dir, current_name, "relevance.json")))
-        self.analysis_state.params = LucidDeParams(**load_json_data(os.path.join(
-            self.base_dir, current_name, "params.json")))
+    @classmethod
+    def load_model(cls, params: Union[Dict, LucidDeParams], base_dir: str):
+        if isinstance(params, LucidDeParams):
+            params = params.__dict
+        current_name = cls.model_name(**params)
+        current_features = cls.features_holder_cls(**load_json_data(
+            os.path.join(base_dir, current_name, "relevance.json")))
+        params = LucidDeParams(**load_json_data(os.path.join(
+            base_dir, current_name, "params.json")))
 
         max_par = {
-            "packets_per_session": self.analysis_state.params.max_packets_per_session or
-            self.analysis_state.params.packets_per_session,
-            "features": self.analysis_state.params.max_features or
-            self.analysis_state.params.features}
-        self.model = self._get_arch(
-            **max_par, **{k: v for k, v in self.analysis_state.params.__dict__.items() if k not in max_par})
-        self.model.load_weights(os.path.join(
-            self.base_dir, self.model_name(**max_par), "weights.h5"))
-        self._init_scale_method()
+            "packets_per_session": params.max_packets_per_session or params.packets_per_session,
+            "features": params.max_features or params.features}
+        model = cls._get_arch(
+            **max_par, **{k: v for k, v in params.__dict__.items() if k not in max_par})
+        model.load_weights(os.path.join(
+            base_dir, cls.model_name(**max_par), "weights.h5"))
+        return current_features, params, model
 
     def preprocess_samples(self, ta: LucidTrafficAnalyser):
         is_nested = isinstance(
@@ -291,8 +317,7 @@ class LucidCnn(DetectionEngine):
         between the new value and the baseline."""
         baseline = TrainMetric(
             _threshold=malicious_threshold, _ytrue=y,
-            _ypred=np.squeeze(model.predict(
-                x, batch_size=batch_size, verbose=0), axis=1).astype(np.float64))
+            _ypred=cls.predict(model, x, batch_size=batch_size))
         minimize = metric in ("log_loss", "fp", "fpr", "fn", "fnr")
 
         if only_active:
@@ -334,7 +359,7 @@ class LucidCnn(DetectionEngine):
             cls, packets_per_session: int = None, features: int = None,
             max_packets_per_session: int = None, max_features: int = None,
             kernels: int = 64, dropout: float = 0.2,
-            regularization: str = "l2", learning_rate: float = 0.001, **kwargs):
+            regularization: str = "l2", learning_rate: float = 0.001,  **kwargs):
         """Method that defines the architecture of the CNN model"""
         if max_packets_per_session:
             packets_per_session = max_packets_per_session
@@ -346,7 +371,7 @@ class LucidCnn(DetectionEngine):
                                     input_shape=(packets_per_session, features)),
             # kernel size = (minimo tra n° packets e 3, n° features) - input shape = (n°pacchetti, n°features, 1)
             tf.keras.layers.Conv2D(kernels, (min(packets_per_session, 3), features),
-                                   kernel_regularizer=regularization, name='Conv2D'),
+                                   kernel_regularizer=regularization, name='TARGET'),
             tf.keras.layers.Dropout(dropout, name="Dropout"),
             tf.keras.layers.Activation(tf.keras.activations.relu, name="ReLu"),
             # pool size = (massimo tra 1 e n°pacchetti-2, 1)
@@ -367,7 +392,8 @@ class LucidCnn(DetectionEngine):
     def _init_scale_method(self):
         """Method to compute the max value of each feature for the scaling, and set the max value of the
         Time feature to the time window"""
-        Time.limit = self.analysis_state.time_window
+        Time.limit = self.analysis_state.time_window if self.analysis_state.time_window > 0 else (
+            1 << 64)
 
         # check if need to keep features indexes also for those inactive
         if self.analysis_state.params.max_features is not None:
@@ -385,31 +411,35 @@ class LucidCnn(DetectionEngine):
             self.adjust_timestamp = next((i for i, k in enumerate(
                 self.analysis_state.current_features.value) if k == Time), None)
 
-    @classmethod
-    def append_to_dataset(cls, source, dest, ttype, label, indexes=None):
+    @staticmethod
+    def append_to_dataset(source, dest, ttype, label, indexes_tr, indexes_val, indexes_ts, **kwargs):
         source += ".h5"
-        dest += ".h5"
-        with h5py.File(source, 'r') as dataset, h5py.File(dest, 'a') as new_dataset:
-            t = dataset[ttype] if ttype in dataset else dataset["set_x"]
-            plus_shape = t.shape[0] if not indexes else len(indexes)
-            if 'set_x' in new_dataset:
-                new_dataset['set_x'].resize(
-                    (new_dataset['set_x'].shape[0] + plus_shape), axis=0)
-                new_dataset['set_x'][-plus_shape:] = t if not indexes else t[indexes]
-                new_dataset['set_y'].resize(
-                    (new_dataset['set_y'].shape[0] + plus_shape), axis=0)
-                new_dataset['set_y'][-plus_shape:
-                                     ] = np.array([label]*plus_shape, dtype=np.float64)
-            else:
-                new_dataset.create_dataset('set_x', data=t if not indexes
-                                           else t[indexes], maxshape=(None, *t.shape[1:]))
-                new_dataset.create_dataset('set_y', data=np.array(
-                    [label]*plus_shape, dtype=np.float64), maxshape=(None,))
-        return None
+        with h5py.File(source, 'r') as dataset:
+            t = dataset[ttype][:]
+
+        for f, iii in zip(("train", "validation", "test"), (indexes_tr, indexes_val, indexes_ts)):
+            with h5py.File(os.path.join(dest, f"{f}.h5"), 'a') as new_dataset:
+                t_tmp = t[iii, ...]
+                plus_shape = len(iii)
+                if 'set_x' in new_dataset:
+                    new_dataset['set_x'].resize(
+                        (new_dataset['set_x'].shape[0] + plus_shape), axis=0)
+                    new_dataset['set_x'][-plus_shape:] = t_tmp
+                    new_dataset['set_y'].resize(
+                        (new_dataset['set_y'].shape[0] + plus_shape), axis=0)
+                    new_dataset['set_y'][-plus_shape:
+                                         ] = np.array([label]*plus_shape, dtype=np.float64)
+                else:
+                    new_dataset.create_dataset(
+                        'set_x', data=t_tmp, maxshape=(None, *t_tmp.shape[1:]))
+                    new_dataset.create_dataset('set_y', data=np.array(
+                        [label]*plus_shape, dtype=np.float64), maxshape=(None,))
 
     @classmethod
     def train(cls, dataset_path: str, models_dir, train_param: LucidDeParams,
-              packets_per_session: int, features: int):
+              split_type: SplitType, split_chunk: Tuple[int, int],
+              packets_per_session: int, features: int,
+              autoencoder=False):
         previous = train_param.previous_one(packets_per_session, features)
         # start from a previous features holder and pop less relevant feature
         # untill the current number of features is matched
@@ -439,13 +469,28 @@ class LucidCnn(DetectionEngine):
         (xt, yt, _), (xv, yv, _), (xts, yts, pt) = cls._load_dataset(
             dataset_path, features_holder, packets_per_session=packets_per_session,
             max_packets_per_session=train_param.max_packets_per_session,
-            max_features=train_param.max_features)
+            max_features=train_param.max_features,
+            split_type=split_type, split_chunk=split_chunk)
         set_seed()
+        if train_param.learn_only_from_benign:
+            xt = xt[np.where(yt == 0.0)[0], ...]
+            yt = yt[np.where(yt == 0.0)[0], ...]
+            xvv = xv
+            yvv = yv
+            xv = xv[np.where(yv == 0.0)[0], ...]
+            yv = yv[np.where(yv == 0.0)[0], ...]
+
+        if autoencoder:
+            yt = np.reshape(
+                xt, (xt.shape[0], np.prod([x for x in xt.shape[1:]])))
+            yv = np.reshape(
+                xv, (xv.shape[0], np.prod([x for x in xv.shape[1:]])))
 
         name = cls.model_name(
             packets_per_session=packets_per_session, features=features)
 
         combs = get_all_dict_comb(hyper)
+
         n_len = len(combs)
 
         if train_param.is_to_train:
@@ -461,8 +506,10 @@ class LucidCnn(DetectionEngine):
                         features=train_param.max_features or features, verbose=0),
                     hyper, cv=[(slice(None), slice(None))],
                     n_iter=n_comb, refit=False, verbose=0, n_jobs=-1, pre_dispatch=n_dispatch)
-                rnd_search_cv.fit(xt, yt, epochs=train_param.epochs, validation_data=(xv, yv), callbacks=[
-                    tf.keras.callbacks.EarlyStopping(monitor='val_loss', mode="min", patience=train_param.max_loss)])
+                rnd_search_cv.fit(x=xt, y=yt, epochs=train_param.epochs, validation_data=(xv, yv),
+                                  callbacks=[tf.keras.callbacks.EarlyStopping(monitor='val_loss',
+                                                                              mode="min",
+                                                                              patience=train_param.max_loss)])
                 hyper = rnd_search_cv.best_params_
             else:
                 hyper = combs[0]
@@ -474,7 +521,7 @@ class LucidCnn(DetectionEngine):
             best_model = cls._get_arch(packets_per_session=train_param.max_packets_per_session or packets_per_session,
                                        features=train_param.max_features or features, **hyper)
 
-            hs = best_model.fit(xt, yt,
+            hs = best_model.fit(x=xt, y=yt,
                                 validation_data=(xv, yv),
                                 batch_size=train_param.batch_size,
                                 epochs=train_param.epochs, verbose=1,
@@ -497,9 +544,15 @@ class LucidCnn(DetectionEngine):
             models_dir = os.path.join(models_dir, os.pardir, cls.model_name(
                 packets_per_session=train_param.max_packets_per_session, features=train_param.max_features or features))
 
+        best_model.load_weights(os.path.join(models_dir, "weights.h5"))
+
+        if train_param.malicious_threshold < 0:
+            train_param.malicious_threshold = TrainMetric.get_best_threshold_roc(
+                cls.predict(best_model, xv, **hyper), yv)
+
         if train_param.is_to_rerank:
             _logger.info(f"Computing features importances for {name}")
-            cls._compute_features_weights(features_holder, xv, yv, best_model,
+            cls._compute_features_weights(features_holder, xvv, yvv, best_model,
                                           train_param.malicious_threshold, train_param.batch_size,
                                           metric=train_param.rank_metric,
                                           only_active=train_param.max_features is None)
@@ -510,12 +563,4 @@ class LucidCnn(DetectionEngine):
             features_holder = features_holder.__class__(**load_json_data(
                 os.path.join(models_dir, os.pardir, previous, "relevance.json")))
 
-        best_model.load_weights(os.path.join(models_dir, "weights.h5"))
-
-        _logger.info(f"Testing {name}")
-        y_pred = np.squeeze(best_model.predict(
-            xts, batch_size=train_param.batch_size, verbose=0), axis=1).astype(np.float64)
-
-        return hs, train_param, TrainMetric(
-            _threshold=train_param.malicious_threshold,
-            _ypred=y_pred, _ytrue=yts), features_holder, pt
+        return hs, train_param, best_model, xts, yts, features_holder, pt

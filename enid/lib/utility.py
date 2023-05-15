@@ -330,6 +330,17 @@ def nullable_int(val: str) -> int:
     return ret
 
 
+class SplitType(Enum):
+    EQUALLY = 0
+    PROPORTIONED = 1
+    NONE = 2
+
+
+def splittable_int(val: str) -> int:
+    """Utility function to convert int into SplitType Enum"""
+    return SplitType(int(val))
+
+
 def all_subclasses(cls, recursive=False):
     """Function to return all subclasses of a given class, optionally
     searching for recursive ones."""

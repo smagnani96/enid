@@ -49,7 +49,7 @@ def _splitter(src_pcap, dst_pcap, pcap_size):
         buf.append((ts, raw))
         curr_bytes += len(raw) + 16  # 16 bytes of timestamp
         dump_bytes += len(raw) + 16
-        if dump_bytes > 2 * 1024**2:  # dump data every 1MB of buffer
+        if dump_bytes > 2 * 1024**2 or curr_bytes >= pcap_size:  # dump data every 1MB of buffer
             for x, y in buf:
                 w.write(y, ts=x)
             buf.clear()

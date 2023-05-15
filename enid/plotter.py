@@ -378,6 +378,10 @@ def main(args_list):
     parser.add_argument(
         '-tsd', '--test-results-detailed', help='display chart per-capture in test', action="store_true")
     parser.add_argument(
+        '-tl', '--transfer-learning', help='transfer learning', action="store_true")
+    parser.add_argument(
+        '-tld', '--transfer-learning-detailed', help='transfer learning detailed', action="store_true")
+    parser.add_argument(
         '-b', '--boxplot', help='condense in boxplot', action="store_true")
     args = parser.parse_args(args_list).__dict__
 
@@ -385,16 +389,6 @@ def main(args_list):
         **load_json_data(os.path.join(args["de_models_dir"], os.pardir, "conf.json")))
     models_conf: ModelConfig = ModelConfig(
         **load_json_data(os.path.join(args["de_models_dir"], "models", "conf.json")))
-
-    # enable all plots in case of no arguments provided
-    if not args["features_relevance"] and not args["train_histories"] and not args[
-            "train_results"] and not args["test_results"] and not args[
-                "test_results_detailed"] and not args[
-                    "train_results_detailed"] and not args["model_complexity"]:
-        args["features_relevance"] = args["train_histories"] = args[
-            "train_results"] = args["test_results"] = args[
-                "train_results_detailed"] = args["test_results_detailed"] = args[
-                    "model_complexity"] = args["boxplot"] = True
 
     star_tasks = []
     plot_args = PlotArgs()
@@ -453,7 +447,7 @@ def main(args_list):
                 continue
             # print train results detailed at the DATASET granularity for each parameter
             # (e.g., feature F in the x-axes, packets P in the x-axes)
-            for dataset_name, v in dataset_conf.test.datasets.items():
+            for dataset_name, v in dataset_conf.offline.datasets.items():
                 create_dir(os.path.join(
                     args["de_models_dir"], "charts", "models", "results", dataset_name, f"total_by_{k}"))
                 [star_tasks.append((_plot_results_metrics, (k, models_conf, tmp, m, plot_args, "", (dataset_name,))))
@@ -550,7 +544,105 @@ def main(args_list):
             for k in models_conf.train_params.train_combs():
                 if len(getattr(models_conf.train_params, k)) <= 1:
                     continue
-                for dataset_name, v in dataset_conf.test.datasets.items():
+                for dataset_name, v in dataset_conf.online.datasets.items():
+                    create_dir(os.path.join(
+                        args["de_models_dir"], "charts", x, "results", dataset_name, f"total_by_{k}"))
+                    [star_tasks.append((_plot_results_metrics, (k, models_conf, tmp, m, plot_args, "", (dataset_name,))))
+                        for m in TestMetric.get_metrics()]
+
+                    # print test results detailed at the DATASET granularity condensing plots by the parameters of interest
+                    # (e.g., each box in the boxplot refers to a specific features F' and all models with that F'
+                    # but other different parameters, such as all packets P)
+                    if args["boxplot"] and sum(len(getattr(models_conf.train_params, kk))
+                                               for kk in models_conf.train_params.train_combs() if kk != k) > 1:
+                        create_dir(os.path.join(
+                            args["de_models_dir"], "charts", x, "results", dataset_name, f"condensed_by_{k}"))
+                        [star_tasks.append((_plot_results_metrics_boxplot, (k, models_conf, args["de_models_dir"],
+                                                                            m, x, plot_args, (dataset_name,))))
+                         for m in TestMetric.get_metrics()]
+
+                    # print test results detailed at the CATEGORY granularity for each parameter
+                    # (e.g., feature F in the x-axes, packets P in the x-axes)
+                    for c, vv in v.categories.items():
+                        create_dir(os.path.join(
+                            args["de_models_dir"], "charts", x, "results", dataset_name, c, f"total_by_{k}"))
+                        [star_tasks.append((_plot_results_metrics, (k, models_conf, tmp, m, plot_args, "", (dataset_name, c))))
+                            for m in TestMetric.get_metrics()]
+
+                        # print test results detailed at the CATEGORY granularity condensing plots by the parameters
+                        # of interest (e.g., each box in the boxplot refers to a specific features F' and all models
+                        # with that F' but other different parameters, such as all packets P)
+                        if args["boxplot"] and sum(len(getattr(models_conf.train_params, kk))
+                                                   for kk in models_conf.train_params.train_combs() if kk != k) > 1:
+                            create_dir(os.path.join(
+                                args["de_models_dir"], "charts", x, "results", dataset_name, c, f"condensed_by_{k}"))
+                            [star_tasks.append((_plot_results_metrics_boxplot, (k, models_conf, args["de_models_dir"],
+                                                                                m, x, plot_args, (dataset_name, c))))
+                             for m in TestMetric.get_metrics()]
+
+                        # print test results detailed at the PCAP granularity for each parameter
+                        # (e.g., feature F in the x-axes, packets P in the x-axes)
+                        for capture in vv.captures:
+                            create_dir(os.path.join(
+                                args["de_models_dir"], "charts", x, "results", dataset_name, c, capture, f"total_by_{k}"))
+                            [star_tasks.append((_plot_results_metrics,
+                                                (k, models_conf, tmp, m, plot_args, "", (dataset_name, c, capture))))
+                                for m in TestMetric.get_metrics()]
+                            # print test results detailed at the PCAP granularity condensing plots by the parameters
+                            # of interest (e.g., each box in the boxplot refers to a specific features F' and
+                            # all models with that F' but other different parameters, such as all packets P)
+                            if args["boxplot"] and sum(len(getattr(models_conf.train_params, kk))
+                                                       for kk in models_conf.train_params.train_combs() if kk != k) > 1:
+                                create_dir(os.path.join(
+                                    args["de_models_dir"], "charts", x, "results", dataset_name,
+                                    c, capture, f"condensed_by_{k}"))
+                                [star_tasks.append((_plot_results_metrics_boxplot,
+                                                    (k, models_conf, args["de_models_dir"],
+                                                     m, x, plot_args, (dataset_name, c, capture))))
+                                 for m in TestMetric.get_metrics()]
+
+    if args["transfer_learning"]:
+        # look for folder with results of either a transfer learning
+        for x in os.listdir(args["de_models_dir"]):
+            tmp = os.path.join(args["de_models_dir"], x)
+            if not os.path.isdir(tmp) or not x.startswith("transfer"):
+                continue
+
+            # print test results for each parameter (e.g., feature F in the x-axes, packets P in the x-axes)
+            for k in models_conf.train_params.train_combs():
+                if len(getattr(models_conf.train_params, k)) <= 1:
+                    continue
+                create_dir(os.path.join(
+                    args["de_models_dir"], "charts", x, "results", f"total_by_{k}"))
+                [star_tasks.append((_plot_results_metrics, (k, models_conf, tmp, m, plot_args)))
+                    for m in TrainMetric.get_metrics()]
+
+                # print test results condensing plots by the parameters of interest
+                # (e.g., each box in the boxplot refers to a specific features F' and all models with that F'
+                # but other different parameters, such as all packets P)
+                if args["boxplot"] and sum(len(getattr(models_conf.train_params, kk))
+                                           for kk in models_conf.train_params.train_combs() if kk != k) > 1:
+                    create_dir(os.path.join(
+                        args["de_models_dir"], "charts", x, "results", f"condensed_by_{k}"))
+                    [star_tasks.append((_plot_results_metrics_boxplot, (k, models_conf, args["de_models_dir"],
+                                                                        m, x, plot_args)))
+                     for m in TrainMetric.get_metrics()]
+
+    if args["transfer_learning_detailed"]:
+        # look for folder with results of either one of the two test types (NORMAL and THROUGHPUT)
+        for x in os.listdir(args["de_models_dir"]):
+            tmp = os.path.join(args["de_models_dir"], x)
+            if not os.path.isdir(tmp) or not x.startswith("transfer"):
+                continue
+
+            other_conf = DatasetConfig(
+                **load_json_data(os.path.join(tmp, "conf.json")))
+            # print test results for each parameter (e.g., feature F in the x-axes, packets P in the x-axes)
+            for k in models_conf.train_params.train_combs():
+                if len(getattr(models_conf.train_params, k)) <= 1:
+                    continue
+
+                for dataset_name, v in other_conf.offline.datasets.items():
                     create_dir(os.path.join(
                         args["de_models_dir"], "charts", x, "results", dataset_name, f"total_by_{k}"))
                     [star_tasks.append((_plot_results_metrics, (k, models_conf, tmp, m, plot_args, "", (dataset_name,))))

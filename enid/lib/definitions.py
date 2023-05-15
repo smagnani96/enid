@@ -14,22 +14,24 @@
 """File containing the most important definitions of classes and behaviours."""
 import importlib
 import os
+import pickle
 import time
-from itertools import cycle
 from abc import ABC, abstractclassmethod, abstractmethod
-from dataclasses import dataclass, field, replace, fields
+from dataclasses import dataclass, field, fields, replace
 from enum import Enum
-from typing import Dict, List, Tuple, Type, Union, OrderedDict
+from itertools import cycle
+from typing import Dict, List, OrderedDict, Tuple, Type, Union
 
-import joblib
 import numpy as np
 from pypacker.layer3.ip import IP
 from pypacker.ppcap import Reader
 
 from .identifiers import BaseKey, TwoIPsProtoPortsKey, str_to_key
-from .metrics import BaseStats, ComputationalRequirements, Stats, TestMetric, ResultTest, ResultTestDataset, ResultTestCategory
-from .utility import (CDataJSONEncoder, EthInPcap, camel_to_snake, get_logger, safe_division,
-                      snake_to_camel, get_all_dict_comb, load_json_data)
+from .metrics import (BaseStats, ComputationalRequirements, ResultTest,
+                      ResultTestCategory, ResultTestDataset, Stats, TestMetric)
+from .utility import (CDataJSONEncoder, EthInPcap, SplitType, camel_to_snake,
+                      get_all_dict_comb, get_logger, load_json_data,
+                      safe_division, snake_to_camel)
 
 
 @dataclass
@@ -307,7 +309,11 @@ class TrafficAnalyser(ABC):
         self.de: Type[DetectionEngine] = detection_engine_cls(
             self.analysis_state, models_dir)
         if test_type != TestType.PROCESSING:
-            self.de.load_model()
+            a, b, c = self.de.load_model(params.__dict__, self.de.base_dir)
+            self.de.model = c
+            self.analysis_state.params = b
+            self.analysis_state.current_features = a
+            self.de._init_scale_method()
         self.results = ResultTest()
         self.attackers = {ds: (
             next(x for x in attackers if x.dataset == ds).__class__,
@@ -333,8 +339,16 @@ class TrafficAnalyser(ABC):
         de_cpu, conversion_time, preprocessing_time, predict_time, de_mem, y_pred = 0, 0, 0, 0, 0, None
         # check if at least 1 session is monitored.
         if self.current_session_map:
-            de_mem, y_pred, conversion_time, preprocessing_time, predict_time = self.de.predict(
+
+            data, conversion_time, preprocessing_time = self.de.preprocess_samples(
                 self)
+            predict_time = time.clock_gettime_ns(time.CLOCK_PROCESS_CPUTIME_ID)
+            y_pred = self.de.predict(
+                self.de.model, data, **self.analysis_state.params.__dict__)
+            predict_time = time.clock_gettime_ns(
+                time.CLOCK_PROCESS_CPUTIME_ID) - predict_time
+
+            de_mem = round(data.nbytes/len(y_pred))
             de_cpu = self.de.parameters(model=self.de.model)
             tmp = []
             # assign the prediction to each flow and create the list of flows to be blacklisted
@@ -376,7 +390,7 @@ class TrafficAnalyser(ABC):
             self.start_time_window = ts
 
         # check whether time window is finished
-        if ts - self.start_time_window >= self.analysis_state.time_window:
+        if self.analysis_state.time_window > 0 and ts - self.start_time_window > self.analysis_state.time_window:
             # invoke method and clear all data structures (except global blacklist)
             self._terminate_timewindow_preprocessing()
             self.current_session_map.clear()
@@ -410,7 +424,7 @@ class TrafficAnalyser(ABC):
             self.start_time_window = ts
 
         # check whether time window is finished
-        if ts - self.start_time_window >= self.analysis_state.time_window:
+        if self.analysis_state.time_window > 0 and ts - self.start_time_window > self.analysis_state.time_window:
             # invoke method and clear all data structures (except global blacklist)
             self._terminate_timewindow()
             self.current_session_map.clear()
@@ -477,7 +491,7 @@ class TrafficAnalyser(ABC):
             sess_id.dataset, sess_id.category, sess_id.pcap)] += t
 
     @staticmethod
-    def generate_packets(pcap, analyser: "TrafficAnalyser", identifier=None, labels=None):
+    def generate_packets(pcap, analyser: "TrafficAnalyser", identifier=None, labels=None) -> int:
         """Method to generate packets  for the analyser provided from the pcap.
         If present, this function tries to load the packets' labels, such as the
         dataset category and pcap of belonging."""
@@ -486,8 +500,8 @@ class TrafficAnalyser(ABC):
                 **analyser.analysis_state.params.__dict__)
         logger = get_logger(identifier)
         if not labels:
-            with open(pcap.replace(".pcap", ".joblib"), "rb") as fp:
-                labels = joblib.load(fp)
+            with open(pcap.replace(".pcap", ".pickle"), "rb") as fp:
+                labels = pickle.load(fp)
             method = analyser._new_packet
         else:
             labels = cycle([labels])
@@ -495,7 +509,10 @@ class TrafficAnalyser(ABC):
         tot_bytes = os.path.getsize(pcap)
         curr_bytes = 0
 
+        tot_time = 0
         for curr_pkts, ((s_dataset, s_category, s_pcap), (ts, buf)) in enumerate(zip(labels, Reader(filename=pcap))):
+            if curr_pkts == 0:
+                tot_time = ts
             curr_bytes += len(buf) + 16  # timestamp in nanoseconds
             if curr_pkts % 50000 == 0:
                 logger.info("Read {}% bytes ({}/{}) and packet n°{}".format(
@@ -513,6 +530,7 @@ class TrafficAnalyser(ABC):
             analyser.results.update()
 
         logger.info("Finished")
+        return ts - tot_time
 
     def _get_sess_type(self, sess_id):
         """Method to return 0/1 whether the session identifier is malicious"""
@@ -692,16 +710,30 @@ class DetectionEngine(ABC):
                 ret.append(snake_to_camel(x.replace(".py", "")))
         return ret
 
-    @abstractmethod
-    def load_model(self):
+    @abstractclassmethod
+    def load_model(cls, params: Union[DeParams, Dict], basedir: str):
         """Abstract method to be implemented, used for loading the model"""
+        raise NotImplementedError()
+
+    def _init_scale_method(self):
         pass
+
+    @staticmethod
+    def _load_dataset(basename, features_holder: FeaturesHolder, packets_per_session=None,
+                      max_packets_per_session=None, max_features=None,
+                      split_type=SplitType.NONE, split_chunk: Tuple[int, int] = tuple(), **kwargs):
+        raise NotImplementedError()
+
+    @staticmethod
+    @abstractmethod
+    def _fed_adapt_layer(src_w, dst_w, global_f, local_f, pad=False):
+        raise NotImplementedError()
 
     @abstractclassmethod
     def parameters(cls, model=None, **kwargs) -> int:
         """Method to be implemented and return the complexity of the model in terms of
         trainable parameters"""
-        pass
+        raise NotImplementedError()
 
     @classmethod
     @property
@@ -723,12 +755,12 @@ class DetectionEngine(ABC):
         pass
 
     @abstractmethod
-    def preprocess_samples(self, ta: Type[TrafficAnalyser]) -> Tuple[np.ndarray, int, int]:
+    def preprocess_samples(self, ta: Type[TrafficAnalyser], skip: bool = False) -> Tuple[np.ndarray, int, int]:
         """Method to preprocess samples captured by the analyser"""
         pass
 
-    @abstractmethod
-    def predict(self, **kwargs) -> Tuple[int, np.ndarray, int, int, int]:
+    @classmethod
+    def predict(cls, model, data, **kwargs) -> np.ndarray:
         """Method for classifying the data"""
         pass
 
@@ -742,13 +774,15 @@ class DetectionEngine(ABC):
         """Method for importing and returning the Detection Engine class provided as string"""
         return getattr(importlib.import_module('.engines.{}'.format(camel_to_snake(name)), package="enid.lib"), name)
 
-    @abstractclassmethod
-    def append_to_dataset(cls, source, dest, ttype, label, indexes=None, **kwargs):
+    @staticmethod
+    @abstractmethod
+    def append_to_dataset(source, dest, ttype, label, indexes_tr, indexes_val, indexes_ts, **kwargs):
         """Method for appending single processed data to the dataset"""
         pass
 
     @abstractclassmethod
-    def train(cls, dataset_path: str, models_dir: str, params: Type[DeParams], **kwargs):
+    def train(cls, dataset_path: str, models_dir: str, params: Type[DeParams], split_type: SplitType,
+              split_chunk: Tuple[int, int], **kwargs):
         """Method for training an instance of the model"""
         pass
 

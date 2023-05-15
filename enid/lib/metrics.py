@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """File for defining metrics used within the offline and online test"""
+import math
 from dataclasses import dataclass, field, fields
 from enum import Enum
-from typing import Tuple, Union, List, Dict, Type
+from typing import Dict, List, Tuple, Type, Union
 
 import numpy as np
 from sklearn.metrics import (accuracy_score, average_precision_score,
@@ -79,6 +80,8 @@ class TrainMetric:
     fnr: float = 0
 
     log_loss: float = 0
+    mcc: float = 0
+    cohen_k: float = 0
     gmean: float = 0
     f1_score: float = 0
     accuracy: float = 0
@@ -105,6 +108,27 @@ class TrainMetric:
         e = CDataJSONEncoder()
         return {k.name: e.default(getattr(self, k.name)) for k in fields(self) if k.repr}
 
+    @staticmethod
+    def get_best_threshold_roc(y_pred, y_true):
+        fpr, tpr, thresholds = roc_curve(y_true, y_pred)
+        # calculate the g-mean for each threshold
+        gmeans = np.sqrt(tpr * (1-fpr))
+        np.nan_to_num(gmeans, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+        # locate the index of the largest g-mean
+        ix = np.argmax(gmeans)
+        return thresholds[ix], gmeans[ix]
+
+    @staticmethod
+    def get_best_threshold_f1(y_pred, y_true):
+        precision, recall, thresholds = precision_recall_curve(
+            y_true, y_pred)
+        # convert to f score
+        fscore = (2 * precision * recall) / (precision + recall)
+        np.nan_to_num(fscore, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+        # locate the index of the largest f score
+        ix = np.argmax(fscore)
+        return thresholds[ix], fscore[ix]
+
     def __post_init__(self):
         """Method called after initialisation. If the class is not empty,
         this method computes all the metrics."""
@@ -114,22 +138,10 @@ class TrainMetric:
         if self._ypred.size == 0 or self._ytrue.size == 0:
             return
 
-        fpr, tpr, thresholds = roc_curve(self._ytrue, self._ypred)
-        # calculate the g-mean for each threshold
-        gmeans = np.sqrt(tpr * (1-fpr))
-        np.nan_to_num(gmeans, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
-        # locate the index of the largest g-mean
-        ix = np.argmax(gmeans)
-        self.best_roc_threshold, self.best_roc_gmean = thresholds[ix], gmeans[ix]
-        precision, recall, thresholds = precision_recall_curve(
-            self._ytrue, self._ypred)
-        # convert to f score
-        fscore = (2 * precision * recall) / (precision + recall)
-        np.nan_to_num(fscore, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
-        # locate the index of the largest f score
-        ix = np.argmax(fscore)
-        self.best_precision_recall_threshold, self.best_precision_recall_f1score = thresholds[
-            ix], fscore[ix]
+        self.best_roc_threshold, self.best_roc_gmean = self.get_best_threshold_roc(
+            self._ypred, self._ytrue)
+        self.best_precision_recall_threshold, self.best_precision_recall_f1score = self.get_best_threshold_f1(
+            self._ypred, self._ytrue)
 
         self.log_loss = log_loss(self._ytrue, self._ypred, labels=[0, 1])
         ypred = np.copy(self._ypred)
@@ -150,6 +162,12 @@ class TrainMetric:
         self.fpr = safe_division(self.fp, self.fp + self.tn, default=0.0)
         self.fnr = safe_division(self.fn, self.fn + self.tp, default=0.0)
 
+        self.mcc = safe_division(self.tn*self.tp-self.fn*self.fp, math.sqrt(
+            (self.tp+self.fp) * (self.tp + self.fn) * (self.tn + self.fp) * (self.tn + self.fn)),
+            default=0.0)
+        self.cohen_k = safe_division(2*(self.tp*self.tn - self.fn * self.fp),
+                                     (self.tp + self.fp) * (self.fp + self.tn) *
+                                     (self.tp + self.fn) * (self.fn + self.tn), default=0.0)
         self.gmean = np.sqrt(self.tpr * (1-self.fpr))
         self.f1_score = f1_score(self._ytrue, ypred, labels=[0, 1])
         self.accuracy = accuracy_score(self._ytrue, ypred)

@@ -34,7 +34,7 @@ class LucidRnn(LucidMlp):
             features = max_features
         model = tf.keras.models.Sequential([
             tf.keras.layers.LSTM(kernels, input_shape=(
-                packets_per_session, features), name="LSTM"),
+                packets_per_session, features), name="TARGET"),
             tf.keras.layers.Dropout(dropout, name="Dropout"),
             tf.keras.layers.Activation(
                 tf.keras.activations.relu, name="ReLu"),
